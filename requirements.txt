@@ -3,3 +3,4 @@ yt-dlp==2024.3.10
 pyrogram==2.0.106
 TgCrypto==1.2.5
 ffmpeg-python==0.2.0
+nest-asyncio==1.5.8
