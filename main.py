@@ -22,15 +22,28 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Initialize Pyrogram client for large file uploads
-pyrogram_client = Client(
-    "bot_session",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=TOKEN
-)
+pyrogram_client = None
 
 # Global user data storage
 user_data = {}
+
+async def init_pyrogram():
+    """Initialize Pyrogram client"""
+    global pyrogram_client
+    try:
+        pyrogram_client = Client(
+            "bot_session",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            bot_token=TOKEN,
+            in_memory=True
+        )
+        await pyrogram_client.start()
+        logger.info("✅ Pyrogram client started successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to start Pyrogram client: {e}")
+        return False
 
 # ========= Telegram Bot Handlers =========
 
@@ -205,9 +218,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def upload_with_pyrogram(file_path: str, chat_id: int, caption: str = "", is_video: bool = True):
     """Upload large files using Pyrogram client"""
+    global pyrogram_client
     try:
-        if not pyrogram_client.is_connected:
-            await pyrogram_client.start()
+        if not pyrogram_client or not pyrogram_client.is_connected:
+            if not await init_pyrogram():
+                return False
         
         if is_video:
             message = await pyrogram_client.send_video(
@@ -374,17 +389,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # ========= Main =========
 
-async def main():
+def main():
     if not TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN environment variable is not set!")
         return
-    
-    # Start Pyrogram client
-    try:
-        await pyrogram_client.start()
-        logger.info("✅ Pyrogram client started successfully")
-    except Exception as e:
-        logger.error(f"Failed to start Pyrogram client: {e}")
     
     # Create application
     application = Application.builder().token(TOKEN).build()
@@ -397,23 +405,69 @@ async def main():
 
     logger.info("🚀 Bot is starting with enhanced features...")
     
-    # Check environment
-    if os.getenv("KOYEB_APP"):
+    # Check environment and run accordingly
+    if os.getenv("KOYEB_APP") or os.getenv("PORT"):
         # Production webhook mode
         PORT = int(os.environ.get('PORT', 8000))
-        APP_NAME = os.getenv('KOYEB_APP_NAME')
-        WEBHOOK_URL = f"https://{APP_NAME}.koyeb.app/"
         
+        # For Koyeb, the URL format is: https://app-name.koyeb.app
+        app_name = os.getenv('KOYEB_APP_NAME', 'your-app')
+        WEBHOOK_URL = f"https://{app_name}.koyeb.app/"
+        
+        logger.info(f"Starting webhook mode on port {PORT}")
+        logger.info(f"Webhook URL: {WEBHOOK_URL}")
+        
+        # Initialize Pyrogram in a separate task
+        async def init_and_run():
+            await init_pyrogram()
+            
+        # Run webhook
         application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
             webhook_url=WEBHOOK_URL,
             url_path="",
+            close_loop=False
         )
+        
     else:
         # Development polling mode
-        logger.info("Running in polling mode...")
-        application.run_polling()
+        logger.info("Starting polling mode for development...")
+        
+        # Initialize Pyrogram and run polling
+        async def run_polling():
+            await init_pyrogram()
+            await application.initialize()
+            await application.start()
+            await application.updater.start_polling()
+            
+            try:
+                # Keep running
+                while True:
+                    await asyncio.sleep(1)
+            except KeyboardInterrupt:
+                logger.info("Stopping bot...")
+            finally:
+                await application.updater.stop()
+                await application.stop()
+                await application.shutdown()
+                if pyrogram_client and pyrogram_client.is_connected:
+                    await pyrogram_client.stop()
+        
+        # Run with proper event loop handling
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If loop is already running, create a task
+                asyncio.create_task(run_polling())
+            else:
+                # Start new loop
+                asyncio.run(run_polling())
+        except RuntimeError:
+            # Fallback for environments with existing event loops
+            import nest_asyncio
+            nest_asyncio.apply()
+            asyncio.run(run_polling())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
