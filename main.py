@@ -1,12 +1,17 @@
 import os
 import yt_dlp
 import logging
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from pyrogram import Client
+import time
 
 # ===============================
 # Environment Variables (set in Koyeb dashboard)
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+API_ID = int(os.getenv("API_ID", "20288994"))
+API_HASH = os.getenv("API_HASH", "d702614912f1ad370a0d18786002adbf")
 # ===============================
 
 # Set up logging
@@ -16,7 +21,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global user data storage (in production, use a database)
+# Initialize Pyrogram client for large file uploads
+pyrogram_client = Client(
+    "bot_session",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=TOKEN
+)
+
+# Global user data storage
 user_data = {}
 
 # ========= Telegram Bot Handlers =========
@@ -25,106 +38,196 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_first_name = update.effective_user.first_name
     greeting = (
         f"👋 Hello, {user_first_name}!\n\n"
-        "Send me a TikTok or Instagram link, and I'll download it for you. 📲\n\n"
-        "Supported platforms:\n"
-        "• TikTok\n"
-        "• Instagram (Reels/Posts)\n"
-        "• YouTube\n"
-        "• Twitter/X"
+        "Send me a video link, and I'll download it for you. 📲\n\n"
+        "✨ **Features:**\n"
+        "• Support for large files (up to 2GB)\n"
+        "• High quality downloads\n"
+        "• Fast processing\n\n"
+        "📱 **Supported platforms:**\n"
+        "• TikTok • Instagram • YouTube\n"
+        "• Twitter/X • Facebook • And more!"
     )
-    await update.message.reply_text(greeting)
+    await update.message.reply_text(greeting, parse_mode='Markdown')
 
-def get_available_formats(url: str):
-    """Extract available video formats from the URL"""
+def get_best_formats(url: str):
+    """Get the best available formats optimized for speed"""
     ydl_opts = {
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "extract_flat": False,
     }
-    formats = []
+    
+    formats = {
+        'video': [],
+        'audio': None,
+        'title': 'Unknown'
+    }
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
+            formats['title'] = info.get('title', 'Unknown')[:50]  # Limit title length
             
             # Get video formats
+            video_formats = []
             for f in info.get("formats", []):
                 if (f.get("vcodec") != "none" and 
-                    f.get("acodec") != "none" and 
-                    f.get("ext") in ["mp4", "webm"]):
+                    f.get("ext") in ["mp4", "webm", "mkv"]):
                     
-                    resolution = f.get("resolution") or f"{f.get('width', '?')}x{f.get('height', '?')}"
+                    height = f.get('height', 0)
+                    width = f.get('width', 0)
+                    resolution = f"{width}x{height}" if width and height else "Unknown"
                     filesize = f.get("filesize") or f.get("filesize_approx", 0)
                     
-                    # Skip if file is too large (Telegram limit is 50MB for bots)
-                    if filesize and filesize > 45 * 1024 * 1024:  # 45MB safety margin
-                        continue
-                        
-                    formats.append({
+                    video_formats.append({
                         "format_id": f["format_id"],
                         "resolution": resolution,
+                        "height": height,
                         "ext": f.get("ext", "mp4"),
-                        "filesize": filesize
+                        "filesize": filesize,
+                        "quality": f.get("quality", 0)
                     })
             
-            # Sort by quality (resolution)
-            formats.sort(key=lambda x: int(x["resolution"].split("x")[1]) if "x" in x["resolution"] else 0, reverse=True)
+            # Sort by height (quality) and get best formats
+            video_formats.sort(key=lambda x: x["height"], reverse=True)
             
-            # Limit to top 5 formats to avoid too many buttons
-            return formats[:5]
+            # Select best formats: 1080p, 720p, 480p, 360p, best available
+            selected_heights = [1080, 720, 480, 360]
+            for target_height in selected_heights:
+                for fmt in video_formats:
+                    if fmt["height"] == target_height:
+                        formats['video'].append(fmt)
+                        break
+            
+            # If no standard resolutions found, add the best one
+            if not formats['video'] and video_formats:
+                formats['video'].append(video_formats[0])
+            
+            # Limit to 4 video options max
+            formats['video'] = formats['video'][:4]
+            
+            # Get best audio format
+            for f in info.get("formats", []):
+                if (f.get("acodec") != "none" and f.get("vcodec") == "none" and
+                    f.get("ext") in ["m4a", "mp3", "webm", "ogg"]):
+                    formats['audio'] = {
+                        "format_id": f["format_id"],
+                        "ext": f.get("ext", "m4a"),
+                        "filesize": f.get("filesize") or f.get("filesize_approx", 0)
+                    }
+                    break
             
     except Exception as e:
         logger.error(f"Error extracting formats: {e}")
-        return []
+        return None
+        
+    return formats
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     
-    # Check if URL is from supported platforms
-    supported_sites = [
+    # Check if URL contains common video site patterns
+    video_patterns = [
         "tiktok.com", "instagram.com", "youtube.com", "youtu.be", 
-        "twitter.com", "x.com", "facebook.com", "fb.watch"
+        "twitter.com", "x.com", "facebook.com", "fb.watch",
+        "reddit.com", "streamable.com", "vimeo.com", "dailymotion.com"
     ]
     
-    if not any(site in url.lower() for site in supported_sites):
+    if not any(pattern in url.lower() for pattern in video_patterns):
         await update.message.reply_text(
-            "🚫 Please send a valid link from:\n"
-            "• TikTok\n• Instagram\n• YouTube\n• Twitter/X\n• Facebook"
+            "🚫 Please send a valid video link from supported platforms:\n"
+            "TikTok, Instagram, YouTube, Twitter/X, Facebook, Reddit, etc."
         )
         return
     
-    # Show processing message
-    processing_msg = await update.message.reply_text("🔍 Analyzing video...")
+    # Show quick processing message
+    processing_msg = await update.message.reply_text("⚡ Processing... (This will be quick!)")
     
     try:
-        formats = get_available_formats(url)
-        user_data[update.effective_user.id] = {"url": url, "processing_msg_id": processing_msg.message_id}
+        start_time = time.time()
+        formats = get_best_formats(url)
+        process_time = time.time() - start_time
+        
+        if not formats or not formats['video']:
+            await processing_msg.edit_text(
+                "❌ Could not extract video information. Please check if:\n"
+                "• The link is valid and public\n"
+                "• The video is not private/restricted\n"
+                "• The platform is supported"
+            )
+            return
+        
+        user_data[update.effective_user.id] = {
+            "url": url, 
+            "formats": formats,
+            "processing_msg_id": processing_msg.message_id
+        }
 
-        if formats:
-            buttons = []
+        buttons = []
+        
+        # Add video format buttons
+        for fmt in formats['video']:
+            size_text = ""
+            if fmt["filesize"] and fmt["filesize"] > 0:
+                size_mb = fmt["filesize"] / (1024 * 1024)
+                if size_mb > 1024:
+                    size_text = f" ({size_mb/1024:.1f}GB)"
+                else:
+                    size_text = f" ({size_mb:.0f}MB)"
             
-            # Add video format buttons
-            for f in formats:
-                size_text = ""
-                if f["filesize"]:
-                    size_mb = f["filesize"] / (1024 * 1024)
-                    size_text = f" ({size_mb:.1f}MB)"
-                
-                button_text = f"🎬 {f['resolution']}{size_text}"
-                buttons.append([InlineKeyboardButton(button_text, callback_data=f"video_{f['format_id']}")])
-            
-            # Add audio option
-            buttons.append([InlineKeyboardButton("🎧 Audio Only (MP3)", callback_data="audio_mp3")])
-            
-            reply_markup = InlineKeyboardMarkup(buttons)
-            await processing_msg.edit_text("📋 Choose download option:", reply_markup=reply_markup)
-        else:
-            await processing_msg.edit_text("⚠️ No suitable formats found or video is too large (>45MB).")
+            quality_text = f"📺 {fmt['height']}p" if fmt['height'] > 0 else f"📺 {fmt['resolution']}"
+            button_text = f"{quality_text}{size_text}"
+            buttons.append([InlineKeyboardButton(button_text, callback_data=f"video_{fmt['format_id']}")])
+        
+        # Add audio option
+        if formats['audio']:
+            buttons.append([InlineKeyboardButton("🎵 Audio Only (Best Quality)", callback_data="audio_best")])
+        
+        reply_markup = InlineKeyboardMarkup(buttons)
+        
+        title_preview = formats['title'][:30] + "..." if len(formats['title']) > 30 else formats['title']
+        message_text = (
+            f"🎬 **{title_preview}**\n\n"
+            f"⚡ Analyzed in {process_time:.1f}s\n"
+            f"📊 Choose your preferred quality:\n\n"
+            f"💡 *Large files supported (up to 2GB)*"
+        )
+        
+        await processing_msg.edit_text(message_text, reply_markup=reply_markup, parse_mode='Markdown')
             
     except Exception as e:
         logger.error(f"Error in handle_message: {e}")
-        await processing_msg.edit_text("❌ Error analyzing video. Please try again or check if the link is valid.")
+        await processing_msg.edit_text(
+            f"❌ Error processing video: {str(e)[:100]}\n\n"
+            "Please try again or check if the link is valid."
+        )
+
+async def upload_with_pyrogram(file_path: str, chat_id: int, caption: str = "", is_video: bool = True):
+    """Upload large files using Pyrogram client"""
+    try:
+        if not pyrogram_client.is_connected:
+            await pyrogram_client.start()
+        
+        if is_video:
+            message = await pyrogram_client.send_video(
+                chat_id=chat_id,
+                video=file_path,
+                caption=caption,
+                supports_streaming=True
+            )
+        else:
+            message = await pyrogram_client.send_audio(
+                chat_id=chat_id,
+                audio=file_path,
+                caption=caption
+            )
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error uploading with Pyrogram: {e}")
+        return False
 
 async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -134,18 +237,21 @@ async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_info = user_data.get(user_id)
 
     if not user_info:
-        await query.edit_message_text("❌ Error: Session expired. Please send the link again.")
+        await query.edit_message_text("❌ Session expired. Please send the link again.")
         return
 
     url = user_info["url"]
+    formats = user_info["formats"]
     choice = query.data
 
     try:
-        # Create downloads directory if it doesn't exist
+        # Create downloads directory
         os.makedirs("downloads", exist_ok=True)
+        
+        start_time = time.time()
 
-        if choice.startswith("audio_"):
-            await query.edit_message_text("⏳ Extracting audio...")
+        if choice == "audio_best":
+            await query.edit_message_text("🎵 Downloading audio... ⚡")
             
             ydl_opts = {
                 "format": "bestaudio/best",
@@ -155,42 +261,57 @@ async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "postprocessors": [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
-                    'preferredquality': '192',
+                    'preferredquality': '320',  # High quality
                 }],
             }
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-                title = info.get('title', 'audio')
-                # yt-dlp changes extension to mp3 after postprocessing
-                file_path = f"downloads/{title}.mp3"
+                title = info.get('title', 'audio').replace('/', '_')
                 
-                # Find the actual file (yt-dlp might change filename)
+                # Find the downloaded file
+                file_path = None
                 for file in os.listdir("downloads"):
-                    if file.endswith(".mp3") and title.replace("/", "_") in file:
+                    if file.endswith(".mp3") and any(word in file.lower() for word in title.lower().split()[:3]):
                         file_path = f"downloads/{file}"
                         break
+                
+                if not file_path:
+                    # Fallback: find any mp3 file
+                    for file in os.listdir("downloads"):
+                        if file.endswith(".mp3"):
+                            file_path = f"downloads/{file}"
+                            break
 
-            await query.edit_message_text("📤 Uploading audio...")
-            
-            # Check file size
-            if os.path.getsize(file_path) > 45 * 1024 * 1024:
-                await query.edit_message_text("❌ Audio file too large for Telegram (>45MB)")
-                os.remove(file_path)
+            if not file_path or not os.path.exists(file_path):
+                await query.edit_message_text("❌ Audio extraction failed.")
                 return
+
+            download_time = time.time() - start_time
+            file_size = os.path.getsize(file_path) / (1024 * 1024)
             
-            with open(file_path, "rb") as file:
-                await context.bot.send_audio(
-                    chat_id=query.message.chat_id,
-                    audio=file,
-                    title=title
-                )
+            await query.edit_message_text(f"📤 Uploading audio... ({file_size:.1f}MB)")
             
-            os.remove(file_path)
+            # Use appropriate upload method based on file size
+            chat_id = query.message.chat_id
+            caption = f"🎵 {title}\n⚡ Downloaded in {download_time:.1f}s"
+            
+            if file_size > 45:  # Use Pyrogram for large files
+                upload_success = await upload_with_pyrogram(file_path, chat_id, caption, is_video=False)
+                if not upload_success:
+                    await query.edit_message_text("❌ Upload failed. File might be too large or corrupted.")
+                    return
+            else:  # Use regular bot API for smaller files
+                with open(file_path, "rb") as file:
+                    await context.bot.send_audio(
+                        chat_id=chat_id,
+                        audio=file,
+                        caption=caption
+                    )
 
         elif choice.startswith("video_"):
             format_id = choice.replace("video_", "")
-            await query.edit_message_text("⏳ Downloading video...")
+            await query.edit_message_text("📹 Downloading video... ⚡")
             
             ydl_opts = {
                 "format": format_id,
@@ -202,53 +323,68 @@ async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 file_path = ydl.prepare_filename(info)
-                title = info.get('title', 'video')
+                title = info.get('title', 'video').replace('/', '_')
 
-            await query.edit_message_text("📤 Uploading video...")
+            download_time = time.time() - start_time
+            file_size = os.path.getsize(file_path) / (1024 * 1024)
             
-            # Check file size
-            if os.path.getsize(file_path) > 45 * 1024 * 1024:
-                await query.edit_message_text("❌ Video file too large for Telegram (>45MB)")
-                os.remove(file_path)
-                return
+            await query.edit_message_text(f"📤 Uploading video... ({file_size:.1f}MB)")
             
-            with open(file_path, "rb") as file:
-                await context.bot.send_video(
-                    chat_id=query.message.chat_id,
-                    video=file,
-                    caption=f"📹 {title}"
-                )
+            # Use appropriate upload method
+            chat_id = query.message.chat_id
+            caption = f"🎬 {title}\n⚡ Downloaded in {download_time:.1f}s"
             
-            os.remove(file_path)
+            if file_size > 45:  # Use Pyrogram for large files
+                upload_success = await upload_with_pyrogram(file_path, chat_id, caption, is_video=True)
+                if not upload_success:
+                    await query.edit_message_text("❌ Upload failed. Please try a different quality.")
+                    return
+            else:  # Use regular bot API
+                with open(file_path, "rb") as file:
+                    await context.bot.send_video(
+                        chat_id=chat_id,
+                        video=file,
+                        caption=caption
+                    )
 
-        await query.edit_message_text("✅ Download completed!")
+        total_time = time.time() - start_time
+        await query.edit_message_text(f"✅ Completed in {total_time:.1f}s! 🚀")
 
     except Exception as e:
         logger.error(f"Error in download_handler: {e}")
-        await query.edit_message_text(f"❌ Download failed: {str(e)}")
+        await query.edit_message_text(f"❌ Download failed: {str(e)[:100]}")
     
     finally:
-        # Clean up user data
+        # Clean up
         if user_id in user_data:
             del user_data[user_id]
         
-        # Clean up any remaining files
+        # Remove downloaded files
         try:
             for file in os.listdir("downloads"):
-                os.remove(f"downloads/{file}")
+                file_path = f"downloads/{file}"
+                if os.path.exists(file_path):
+                    os.remove(file_path)
         except:
             pass
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log the error and send a telegram message to notify the developer."""
+    """Enhanced error handler"""
     logger.error("Exception while handling an update:", exc_info=context.error)
 
 # ========= Main =========
 
-def main():
+async def main():
     if not TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN environment variable is not set!")
         return
+    
+    # Start Pyrogram client
+    try:
+        await pyrogram_client.start()
+        logger.info("✅ Pyrogram client started successfully")
+    except Exception as e:
+        logger.error(f"Failed to start Pyrogram client: {e}")
     
     # Create application
     application = Application.builder().token(TOKEN).build()
@@ -257,13 +393,11 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(download_handler))
-    
-    # Add error handler
     application.add_error_handler(error_handler)
 
-    logger.info("🤖 Bot is starting...")
+    logger.info("🚀 Bot is starting with enhanced features...")
     
-    # Use webhook for production (Koyeb), polling for development
+    # Check environment
     if os.getenv("KOYEB_APP"):
         # Production webhook mode
         PORT = int(os.environ.get('PORT', 8000))
@@ -278,8 +412,8 @@ def main():
         )
     else:
         # Development polling mode
-        logger.info("Running in polling mode for development...")
+        logger.info("Running in polling mode...")
         application.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
